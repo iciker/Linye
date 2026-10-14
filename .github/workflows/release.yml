@@ -1,0 +1,300 @@
+name: Release
+
+# Build signed-less release binaries for macOS, Windows, and Linux whenever a
+# version tag is pushed (e.g. `git tag v1.0.0 && git push --tags`), and attach
+# them to a GitHub Release. Can also be run manually from the Actions tab —
+# pass a `tag` (e.g. v1.0.26) to cut a FULL release from the chosen ref:
+# tauri-action creates the tag + release itself, and the AUR/Homebrew publish
+# job runs exactly as it would for a pushed tag.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to cut (e.g. v1.0.26). Empty = throwaway v<run#> draft build, no AUR/Homebrew publish."
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  # Create the release ONCE before the matrix. Four parallel tauri-action jobs
+  # otherwise race to find-or-create the draft for the tag and can create
+  # DUPLICATES — assets then split across two releases and the published one
+  # ships incomplete (observed on v1.0.27: macOS assets on the published
+  # release, Linux+Windows stranded on an orphan draft).
+  prepare:
+    name: Ensure a single release exists
+    if: github.ref_type == 'tag' || inputs.tag != ''
+    runs-on: ubuntu-latest
+    steps:
+      - name: Reconcile to exactly one release for the tag
+        # tauri-action attaches to the FIRST release whose tag_name matches —
+        # and drafts list first. A stray duplicate draft therefore swallows
+        # uploads while the published release stays incomplete (v1.0.27 shipped
+        # macOS-only twice this way). So: delete every DRAFT carrying this tag,
+        # keep a published release if one exists, create a fresh draft only when
+        # nothing remains. After this there is exactly ONE possible target.
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_type == 'tag' && github.ref_name || inputs.tag }}
+        run: |
+          set -euo pipefail
+          gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            --jq ".[] | select(.tag_name == \"$TAG\") | \"\(.id) \(.draft)\"" > /tmp/rels
+          cat /tmp/rels || true
+          published=0
+          while read -r id draft; do
+            if [ "$draft" = "true" ]; then
+              echo "deleting stray draft release $id for $TAG"
+              gh api -X DELETE "repos/$GITHUB_REPOSITORY/releases/$id"
+            else
+              published=1
+            fi
+          done < /tmp/rels
+          if [ "$published" = 1 ]; then
+            echo "published release for $TAG exists — matrix jobs will attach to it"
+          elif [ ! -s /tmp/rels ] || ! grep -q false /tmp/rels; then
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --draft \
+              --title "Cortex $TAG" \
+              --notes "See the assets below to download and install Cortex for your platform." \
+              --target "$GITHUB_SHA"
+            echo "created single draft release for $TAG"
+          fi
+
+  release:
+    # Run after prepare (or when prepare is skipped — a throwaway dispatch
+    # without a tag), but never when prepare actually failed.
+    needs: prepare
+    if: ${{ !failure() && !cancelled() }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Per-arch macOS builds (so bundled sidecars match a concrete triple).
+          - platform: macos-latest
+            args: "--target aarch64-apple-darwin"
+            rust-targets: "aarch64-apple-darwin"
+            sidecar-target: "aarch64-apple-darwin"
+          - platform: macos-latest
+            args: "--target x86_64-apple-darwin"
+            rust-targets: "x86_64-apple-darwin"
+            sidecar-target: "x86_64-apple-darwin"
+          - platform: ubuntu-22.04
+            args: ""
+            rust-targets: ""
+            sidecar-target: ""
+          - platform: windows-latest
+            args: ""
+            rust-targets: ""
+            sidecar-target: ""
+
+    runs-on: ${{ matrix.platform }}
+    # Signing secrets live in the "Production" environment.
+    environment: Production
+    steps:
+      - uses: actions/checkout@v4
+
+      # ── macOS code signing + notarization ──
+      # Imports the cert and exports the signing identity. Best-effort: any
+      # failure logs a warning and sets no `ok` output, so the build step below
+      # skips signing and produces an UNSIGNED .dmg rather than failing.
+      - name: Import Apple Developer certificate
+        id: signcert
+        if: matrix.platform == 'macos-latest'
+        continue-on-error: true
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          set +e
+          if [ -z "$APPLE_CERTIFICATE" ]; then echo "No signing cert configured — building unsigned."; exit 0; fi
+          echo "$APPLE_CERTIFICATE" | base64 --decode > certificate.p12
+          security create-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+          security set-keychain-settings -t 3600 -u build.keychain
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+          # Import FIRST; only adopt the keychain if it works. On failure, tear it
+          # down and exit clean so the build proceeds UNSIGNED (no broken keychain).
+          if ! security import certificate.p12 -k build.keychain -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign; then
+            echo "::warning::Apple cert import failed (wrong .p12 password?) — building UNSIGNED."
+            security delete-keychain build.keychain 2>/dev/null
+            exit 0
+          fi
+          security default-keychain -s build.keychain
+          security list-keychains -d user -s build.keychain login.keychain
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" build.keychain
+          echo "Identities in keychain:"; security find-identity -v -p codesigning build.keychain
+          # Prefer a Developer ID Application identity (required for notarization).
+          CERT_ID=$(security find-identity -v -p codesigning build.keychain | grep "Developer ID Application" | head -1 | sed -E 's/.*"(.*)".*/\1/')
+          [ -z "$CERT_ID" ] && CERT_ID=$(security find-identity -v -p codesigning build.keychain | grep -o '"[^"]*"' | head -1 | tr -d '"')
+          if [ -z "$CERT_ID" ]; then
+            echo "::warning::No usable signing identity — building unsigned."
+            security delete-keychain build.keychain 2>/dev/null
+            exit 0
+          fi
+          echo "APPLE_SIGNING_IDENTITY=$CERT_ID" >> "$GITHUB_ENV"
+          echo "ok=true" >> "$GITHUB_OUTPUT"
+          echo "Using signing identity: $CERT_ID"
+
+      - name: Install Linux build dependencies
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            build-essential \
+            libssl-dev \
+            libfuse2
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust-targets }}
+
+      - name: Cache cargo
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "./src-tauri -> target"
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Install frontend dependencies
+        run: bun install
+
+      # The committed icon.icns wasn't transparent; regenerate it from the transparent
+      # square master (icon-macos.png) on the macOS runner so the Dock/Finder icon is the
+      # floating brain with no background. (iconutil is macOS-only — done here, not in repo.)
+      - name: Regenerate the transparent macOS app icon
+        if: matrix.platform == 'macos-latest'
+        run: |
+          set -e
+          SRC=src-tauri/icons/icon-macos.png
+          mkdir -p Cortex.iconset
+          sips -z 16 16     "$SRC" --out Cortex.iconset/icon_16x16.png      >/dev/null
+          sips -z 32 32     "$SRC" --out Cortex.iconset/icon_16x16@2x.png   >/dev/null
+          sips -z 32 32     "$SRC" --out Cortex.iconset/icon_32x32.png      >/dev/null
+          sips -z 64 64     "$SRC" --out Cortex.iconset/icon_32x32@2x.png   >/dev/null
+          sips -z 128 128   "$SRC" --out Cortex.iconset/icon_128x128.png    >/dev/null
+          sips -z 256 256   "$SRC" --out Cortex.iconset/icon_128x128@2x.png >/dev/null
+          sips -z 256 256   "$SRC" --out Cortex.iconset/icon_256x256.png    >/dev/null
+          sips -z 512 512   "$SRC" --out Cortex.iconset/icon_256x256@2x.png >/dev/null
+          sips -z 512 512   "$SRC" --out Cortex.iconset/icon_512x512.png    >/dev/null
+          sips -z 1024 1024 "$SRC" --out Cortex.iconset/icon_512x512@2x.png >/dev/null
+          iconutil -c icns Cortex.iconset -o src-tauri/icons/icon.icns
+          echo "Regenerated transparent src-tauri/icons/icon.icns"
+
+      - name: Build and release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Tells scripts/fetch-sidecars.mjs (run via beforeBuildCommand) which
+          # triple to fetch binaries for; empty → the runner's host triple.
+          SIDECAR_TARGET: ${{ matrix.sidecar-target }}
+          # macOS signing + notarization — only when the cert imported cleanly
+          # (steps.signcert.outputs.ok). Otherwise all of these are empty and
+          # tauri-action builds an UNSIGNED .dmg instead of failing.
+          APPLE_SIGNING_IDENTITY: ${{ env.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ steps.signcert.outputs.ok == 'true' && secrets.APPLE_ID || '' }}
+          APPLE_PASSWORD: ${{ steps.signcert.outputs.ok == 'true' && secrets.APPLE_PASSWORD || '' }}
+          APPLE_TEAM_ID: ${{ steps.signcert.outputs.ok == 'true' && secrets.APPLE_TEAM_ID || '' }}
+          # Auto-updater artifact signing (minisign). When set, tauri-action also
+          # generates + uploads latest.json for the updater endpoint.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          tagName: ${{ github.ref_type == 'tag' && github.ref_name || inputs.tag || format('v{0}', github.run_number) }}
+          releaseName: "Cortex ${{ github.ref_type == 'tag' && github.ref_name || inputs.tag || github.run_number }}"
+          releaseBody: "See the assets below to download and install Cortex for your platform."
+          releaseDraft: true
+          prerelease: false
+          args: ${{ matrix.args }}
+
+  # ── Publish the release, then update AUR + Homebrew tap automatically ──
+  # Runs only after every matrix build succeeds (so all assets exist), on tag
+  # pushes. Computes checksums from the published assets and pushes the updated
+  # PKGBUILD (AUR) and Cask (tap) — zero manual checksum edits per release.
+  publish-packages:
+    needs: release
+    # Tag pushes AND manual dispatches that name a real tag both publish.
+    if: github.ref_type == 'tag' || inputs.tag != ''
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Publish release & compute checksums
+        id: meta
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || inputs.tag }}
+        run: |
+          set -euo pipefail
+          TAG="${RELEASE_TAG}"; VER="${TAG#v}"
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest
+          mkdir -p dl
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" -D dl \
+            -p "Cortex_${VER}_amd64.deb" -p "Cortex_${VER}_aarch64.dmg" -p "Cortex_${VER}_x64.dmg"
+          # Fail LOUD on an incomplete release — an absent asset previously slid
+          # through as an EMPTY sha256, which the AUR then rejected mid-push.
+          for f in "dl/Cortex_${VER}_amd64.deb" "dl/Cortex_${VER}_aarch64.dmg" "dl/Cortex_${VER}_x64.dmg"; do
+            [ -s "$f" ] || { echo "::error::missing release asset: $f — the $TAG release is incomplete (matrix upload lost?)"; exit 1; }
+          done
+          {
+            echo "ver=$VER"
+            echo "deb=$(sha256sum dl/Cortex_${VER}_amd64.deb | cut -d' ' -f1)"
+            echo "arm=$(sha256sum dl/Cortex_${VER}_aarch64.dmg | cut -d' ' -f1)"
+            echo "x64=$(sha256sum dl/Cortex_${VER}_x64.dmg | cut -d' ' -f1)"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Update PKGBUILD with new version + checksum
+        run: |
+          sed -i "s/^pkgver=.*/pkgver=${{ steps.meta.outputs.ver }}/" packaging/aur/PKGBUILD
+          sed -i "s/^pkgrel=.*/pkgrel=1/" packaging/aur/PKGBUILD
+          sed -i "s|^sha256sums=.*|sha256sums=('${{ steps.meta.outputs.deb }}')|" packaging/aur/PKGBUILD
+
+      - name: Push to the AUR
+        uses: KSXGitHub/github-actions-deploy-aur@v2.7.2
+        with:
+          pkgname: cortex-bin
+          pkgbuild: packaging/aur/PKGBUILD
+          commit_username: Aidan McConnon
+          commit_email: aidanmcconnon210@gmail.com
+          ssh_private_key: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+          commit_message: "cortex-bin ${{ steps.meta.outputs.ver }}"
+
+      - name: Push Cask to Homebrew tap
+        env:
+          DEPLOY_KEY: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
+          VER: ${{ steps.meta.outputs.ver }}
+          ARM: ${{ steps.meta.outputs.arm }}
+          X64: ${{ steps.meta.outputs.x64 }}
+        run: |
+          mkdir -p ~/.ssh && printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/tap && chmod 600 ~/.ssh/tap
+          export GIT_SSH_COMMAND="ssh -i ~/.ssh/tap -o StrictHostKeyChecking=accept-new"
+          git clone git@github.com:PndaMan/homebrew-cortex.git tap
+          mkdir -p tap/Casks
+          # Regenerate the Cask from the committed template, swapping version + the
+          # two dmg checksums (arm in the on_arm block, x64 in on_intel).
+          awk -v ver="$VER" -v arm="$ARM" -v x64="$X64" '
+            /^[[:space:]]*version /{ print "  version \"" ver "\""; next }
+            /on_arm do/{blk="arm"} /on_intel do/{blk="x64"}
+            /^[[:space:]]*sha256 /{
+              if(blk=="arm"){print "    sha256 \"" arm "\""; blk=""; next}
+              if(blk=="x64"){print "    sha256 \"" x64 "\""; blk=""; next}
+            }
+            {print}
+          ' packaging/homebrew/cortex.rb > tap/Casks/cortex.rb
+          cd tap
+          git config user.name "Aidan McConnon"
+          git config user.email "aidanmcconnon210@gmail.com"
+          git add Casks/cortex.rb
+          git diff --cached --quiet && { echo "Cask unchanged"; exit 0; }
+          git commit -m "cortex ${VER}"
+          git push origin main

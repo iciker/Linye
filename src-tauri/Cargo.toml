@@ -1,0 +1,122 @@
+[package]
+name = "cortex"
+version = "1.0.37"
+description = "Cortex — desktop study OS"
+authors = ["Aidan McConnon"]
+license = "Apache-2.0"
+edition = "2021"
+rust-version = "1.77"
+
+[lib]
+name = "cortex_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["protocol-asset", "image-png"] }
+tauri-plugin-dialog = "2"
+tauri-plugin-notification = "2"
+# Open URLs with the platform opener (Safari view / browser / default handler).
+# Replaces hand-spawning xdg-open/open, which simply cannot work on iOS/Android
+# (no fork/exec in the sandbox) — this is what makes "Open in Moodle" work on phones.
+tauri-plugin-opener = "2"
+tauri-plugin-process = "2"
+# Scheduled local notifications (deadline alerts) need concrete fire dates for
+# tauri-plugin-notification's Schedule::At — which speaks time::OffsetDateTime.
+time = "0.3"
+base64 = "0.22"
+percent-encoding = "2"
+# Sync credential encryption: XChaCha20-Poly1305 AEAD (chacha20poly1305) with a key
+# derived from the sync password (sha2). Keeps Google/Moodle tokens — and every other
+# secret — opaque and tamper-evident at rest in the homelab snapshot, so they can't be
+# read or changed outside the app. rand_core/OsRng supplies the per-message nonce.
+chacha20poly1305 = "0.10"
+sha2 = "0.10"
+rand_core = { version = "0.6", features = ["getrandom"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rusqlite = { version = "0.32", features = ["bundled", "hooks"] }
+# sqlite-vec: statically-linked vector search extension (registered via
+# sqlite3_auto_extension at startup — no runtime .so to load).
+sqlite-vec = "0.1.6"
+thiserror = "2"
+uuid = { version = "1", features = ["v4"] }
+regex = "1"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls", "gzip", "multipart"] }
+# Read Anki `.apkg` archives on import (an apkg is a ZIP holding a SQLite
+# collection). Pure-Rust deflate only — no system zlib, no extra C deps. The
+# export path hand-rolls a STORED zip writer; reading needs real unzip, hence
+# this crate (default features off keeps bzip2/zstd/AES out of the build).
+zip = { version = "2", default-features = false, features = ["deflate"] }
+# Pure-Rust PDF text extraction — the on-device fallback when poppler's `pdftotext`
+# CLI isn't present (iOS/Android, or a desktop without poppler). Handles text-layer
+# PDFs entirely in-process; scanned PDFs still need OCR (homelab ingest service).
+pdf-extract = "0.10"
+# Live sync: blocking WebSocket client for the homelab syncd push channel.
+# webpki roots (no system cert store needed) so wss:// works identically on
+# desktop and iOS; ring already builds everywhere here (reqwest uses rustls).
+tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+
+# Desktop-only deps. The system tray, single-instance guard and auto-updater don't
+# exist on iOS/Android, so they're gated to desktop targets and the mobile build
+# links without them. NB: a Cargo target table can't use tauri's `desktop` cfg
+# (that's emitted by tauri-build for CODE, not known to Cargo at resolve time), so
+# we enumerate the desktop OSes here; the matching code is gated `#[cfg(desktop)]`.
+[target.'cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))'.dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-single-instance = "2"
+tauri-plugin-updater = "2"
+
+# macOS 15+: optional combined microphone + system-audio lecture recording.
+# ScreenCaptureKit supplies both audio streams without a virtual loopback device.
+[target.'cfg(target_os = "macos")'.dependencies]
+screencapturekit = { version = "8.0.1", features = ["macos_15_0"] }
+
+# Keep the machine awake while background transcription runs (asr.rs):
+# SetThreadExecutionState needs the raw Win32 Power API. macOS/Linux use the
+# caffeinate / systemd-inhibit CLIs instead — no crate needed there.
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_Power"] }
+
+# iOS-only: native lecture recording (AVAudioRecorder via the objc2 bindings).
+# WKWebView's custom-scheme pages aren't a secure context, so getUserMedia does
+# not exist on iOS — the mic must be captured natively (src/recorder.rs).
+[target.'cfg(target_os = "ios")'.dependencies]
+objc2 = "0.6"
+block2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = [
+  "std", "NSString", "NSURL", "NSDictionary", "NSValue", "NSError", "NSObject",
+] }
+objc2-avf-audio = { version = "0.3", default-features = false, features = [
+  "std", "block2", "AVAudioRecorder", "AVAudioSession", "AVAudioSessionTypes", "AVAudioSettings",
+] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+webkit2gtk = { version = "2.0", features = ["v2_8"] }
+# Used to intercept Ctrl+F at the GTK level (WebKitGTK's native find steals
+# Ctrl+C/V). Versions match webkit2gtk 2.0's gtk-rs (0.18).
+gtk = "0.18"
+gdk = "0.18"
+
+[features]
+# this feature is used for production builds or when a dev server is not specified, DO NOT REMOVE!!
+custom-protocol = ["tauri/custom-protocol"]
+
+# Vendored copy of the notification plugin (same version) carrying one iOS fix:
+# the stock plugin force-unwraps its in-memory notification map when a
+# notification is TAPPED, so tapping any notification delivered by a previous
+# app session (cold start, scheduled deadline alerts) crashed the app on launch.
+# See vendor/tauri-plugin-notification/ios/Sources/NotificationHandler.swift.
+[patch.crates-io]
+tauri-plugin-notification = { path = "vendor/tauri-plugin-notification" }
+
+[profile.release]
+# panic stays "unwind": a panicking command thread shouldn't kill the whole app.
+# fat LTO over thin: a few % smaller binary at no runtime cost (often slightly
+# faster). opt-level is left at the default 3 on purpose — "s"/"z" would shrink
+# the binary but slow the cosine-scan / ingest hot loops, hurting responsiveness.
+lto = "fat"
+codegen-units = 1
+strip = true

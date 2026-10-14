@@ -1,0 +1,47 @@
+# Cortex homelab — single entry point.
+# One URL fronts every optional service; Cortex derives each service URL by
+# appending a path prefix (see src-tauri/src/homelab.rs). `handle_path` strips
+# the prefix before proxying, so the upstreams see their normal paths.
+#
+# Point Cortex (Settings → Integrations → Homelab URL) at this one address,
+# e.g. http://<host>:8080  (or your Tailscale / public HTTPS URL).
+
+:8080 {
+	# ── Optional access token ─────────────────────────────────────────────
+	# Set CORTEX_TOKEN on the proxy container (docker-compose.yml) and the
+	# entrypoint writes a basic_auth snippet into /etc/caddy/auth.d/ that this
+	# import picks up: every service then requires the token (user "cortex"),
+	# which Cortex sends automatically once you paste the same token into
+	# Settings → Integrations → Homelab → Access token. /sync is exempt — the
+	# WebDAV container enforces its own username/password. WITHOUT a token, a
+	# PUBLIC homelab URL leaves whisper/ollama/searxng/ingest open to anyone —
+	# never expose this proxy to the internet with CORTEX_TOKEN unset.
+	import auth.d/*
+
+	handle_path /searxng/* {
+		reverse_proxy searxng:8080
+	}
+	handle_path /whisper/* {
+		# WhisperX lecture server (whisper-asr-webservice) listens on 9000.
+		reverse_proxy whisper:9000
+	}
+	handle_path /ollama/* {
+		reverse_proxy ollama:11434
+	}
+	handle_path /sync/* {
+		reverse_proxy sync:80
+	}
+	handle_path /syncd/* {
+		# Live sync: delta log + WebSocket push (enforces its own Basic auth).
+		reverse_proxy syncd:8787
+	}
+	handle_path /ingest/* {
+		# Apache Tika: document → text (PDF/DOCX/PPTX/legacy + OCR). Cortex mobile
+		# PUTs files to /ingest/tika when a phone can't parse them locally.
+		reverse_proxy ingest:9998
+	}
+	# A bare hit on the base URL is a friendly liveness check.
+	handle / {
+		respond "Cortex homelab is up. Services: /searxng /whisper /ollama /sync /syncd /ingest" 200
+	}
+}

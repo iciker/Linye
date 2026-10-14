@@ -1,0 +1,189 @@
+# Cortex homelab backend — one URL, one command.
+# ----------------------------------------------
+# A single Caddy reverse proxy fronts every optional service, so Cortex needs
+# just ONE address. Services are reached by path prefix off that address:
+#   <url>/searxng  → web search          <url>/whisper → lecture transcription
+#   <url>/ollama   → local LLM/embeddings <url>/sync    → WebDAV live-sync
+#   <url>/ingest   → document parsing (PDF/DOCX/PPTX → text, for mobile)
+# Only Caddy publishes a host port (8080); everything else is internal.
+#
+#   docker compose up -d                    # search + sync + proxy (no Whisper)
+#   docker compose --profile whisper up -d  # optionally add WhisperX
+#   docker compose --profile ollama up -d   # optionally add Ollama
+#
+# Then in Cortex → Settings → Integrations, set the single Homelab URL:
+#   http://<host>:8080      (LAN)         and, optionally, your
+#   https://<name>.ts.net   (Tailscale)   and/or public HTTPS base.
+# Cortex auto-picks the first reachable one (local → Tailscale → public).
+#
+# Expose <host>:8080 over a VPN (Tailscale/Netbird) or a TLS reverse proxy.
+
+services:
+  proxy:
+    image: caddy:2-alpine
+    container_name: cortex-proxy
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      # OPTIONAL access token gating every service except /sync (the WebDAV
+      # container enforces its own username/password). Paste the SAME value into
+      # Cortex → Settings → Integrations → Homelab → Access token. REQUIRED
+      # before exposing this proxy on a public URL — without it, anyone on the
+      # internet can use your whisper/ollama/searxng/ingest.
+      #   CORTEX_TOKEN=some-long-random-string docker compose up -d
+      - CORTEX_TOKEN=${CORTEX_TOKEN:-}
+    # Generate the Caddy basic_auth snippet from CORTEX_TOKEN at startup (the
+    # Caddyfile `import auth.d/*` picks it up), then run Caddy normally.
+    entrypoint:
+      - sh
+      - -c
+      - |
+        mkdir -p /etc/caddy/auth.d
+        if [ -n "$$CORTEX_TOKEN" ]; then
+          HASH=$$(caddy hash-password --plaintext "$$CORTEX_TOKEN")
+          printf '@cortex_protected {\n\tnot path /sync/* /syncd/*\n}\nbasic_auth @cortex_protected {\n\tcortex %s\n}\n' "$$HASH" > /etc/caddy/auth.d/token.caddy
+          echo "cortex-proxy: access token ENABLED"
+        else
+          printf '# no CORTEX_TOKEN set - services are unauthenticated\n' > /etc/caddy/auth.d/token.caddy
+          echo "cortex-proxy: access token DISABLED (set CORTEX_TOKEN before exposing this proxy publicly)"
+        fi
+        exec caddy run --config /etc/caddy/Caddyfile --adapter caddyfile
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+    depends_on:
+      - searxng
+      - sync
+      - ingest
+
+  searxng:
+    image: searxng/searxng:latest
+    container_name: cortex-searxng
+    restart: unless-stopped
+    expose:
+      - "8080"
+    volumes:
+      - ./searxng:/etc/searxng:rw
+    environment:
+      # Served under the proxy's /searxng prefix.
+      - SEARXNG_BASE_URL=http://localhost:8080/searxng/
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
+
+  whisper:
+    # WhisperX lecture server (whisper-asr-webservice) — THE proven long-form
+    # pipeline: VAD-batched inference (no more transcripts cutting off or
+    # repetition-looping on hour-plus lectures), forced alignment, and real
+    # pyannote 3.1 SPEAKER DIARIZATION ("Speaker 1: … / Speaker 2: …").
+    # Use :latest-gpu + ASR_DEVICE=cuda (and the NVIDIA container toolkit) on a
+    # GPU host — an hour-long lecture transcribes in a couple of minutes there.
+    image: onerahmet/openai-whisper-asr-webservice:latest
+    container_name: cortex-whisper
+    restart: unless-stopped
+    profiles: ["whisper"]
+    expose:
+      - "9000"
+    volumes:
+      # Whisper + alignment + pyannote models cache here (lazy-downloaded on
+      # first use; keep the volume so restarts don't re-fetch gigabytes).
+      - whisper-models:/root/.cache
+      # Upstream decodes uploads through a non-seekable stdin pipe, which
+      # produces empty audio for macOS M4A recordings with a trailing index.
+      - ./whisper-utils.py:/app/app/utils.py:ro
+    environment:
+      - ASR_ENGINE=whisperx
+      # PyTorch 2.6+ defaults torch.load to weights_only=true, while the
+      # bundled pyannote VAD checkpoint contains OmegaConf metadata.
+      - TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1
+      # Model tiers (accuracy ↑ / speed ↓): small → distil-large-v3 → large-v3.
+      # distil-large-v3 ≈ large-v3 accuracy on English at a fraction of the
+      # compute — the right default for a CPU box. On GPU, use large-v3.
+      - ASR_MODEL=${WHISPER_MODEL:-distil-large-v3}
+      - ASR_DEVICE=${WHISPER_DEVICE:-cpu}
+      # Keep the WhisperX model loaded. The current upstream image clears the
+      # complete model dictionary on idle unload, but its reload path assumes
+      # that dictionary still exists and crashes the next request with
+      # `TypeError: 'NoneType' object does not support item assignment`.
+      # Restarting this container still releases all model memory.
+      - MODEL_IDLE_TIMEOUT=0
+      # SPEAKER LABELS need a (free) Hugging Face token:
+      #   1. huggingface.co → create account → Settings → Access Tokens → "read" token
+      #   2. Accept the terms on BOTH gated models:
+      #      hf.co/pyannote/speaker-diarization-3.1 and hf.co/pyannote/segmentation-3.0
+      #   3. HF_TOKEN=hf_xxx docker compose up -d
+      # Without it, transcription still works — diarization is silently skipped.
+      - HF_TOKEN=${HF_TOKEN:-}
+
+  sync:
+    # WebDAV target for the binary vault (source files/recordings) and as the
+    # snapshot fallback when syncd (below) isn't reachable.
+    image: bytemark/webdav:latest
+    container_name: cortex-sync
+    restart: unless-stopped
+    expose:
+      - "80"
+    environment:
+      - AUTH_TYPE=Basic
+      - USERNAME=cortex
+      - PASSWORD=change-me-sync-password
+    volumes:
+      - sync-data:/var/lib/dav
+
+  syncd:
+    # Cortex LIVE sync: an ordered delta log with WebSocket push. Devices send
+    # only changed rows and every connected device applies them within a second
+    # — edits show up across desktop/phone instantly, no manual resync. Offline
+    # devices replay from their last sequence number on reconnect, so the only
+    # failure mode is "unreachable" and it self-heals. Uses the SAME credentials
+    # as the WebDAV sync container above — keep USERNAME/PASSWORD in step.
+    build: ./syncd
+    container_name: cortex-syncd
+    restart: unless-stopped
+    expose:
+      - "8787"
+    environment:
+      - SYNC_USER=cortex
+      - SYNC_PASSWORD=change-me-sync-password
+    volumes:
+      - syncd-data:/data
+
+  ingest:
+    # Apache Tika — document parsing for mobile. A phone can't run poppler/
+    # libreoffice, so Cortex offloads PDF/DOCX/PPTX/legacy parsing (and OCR of
+    # scanned pages, via the `-full` tag's bundled Tesseract) here. Served under
+    # the proxy's /ingest prefix; the app PUTs files to /ingest/tika.
+    image: apache/tika:latest-full
+    container_name: cortex-ingest
+    restart: unless-stopped
+    expose:
+      - "9998"
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: cortex-ollama
+    restart: unless-stopped
+    profiles: ["ollama"]   # only starts with `--profile ollama`
+    expose:
+      - "11434"
+    volumes:
+      - ollama-models:/root/.ollama
+    # Uncomment for an NVIDIA GPU (needs the NVIDIA container toolkit):
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+
+volumes:
+  whisper-models:
+  ollama-models:
+  sync-data:
+  syncd-data:
+  caddy-data:

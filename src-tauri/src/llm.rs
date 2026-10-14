@@ -1,0 +1,1219 @@
+//! LLM providers behind one trait, mirroring embed.rs. Default is an offline
+//! `stub` that returns a clearly-marked placeholder so the app works with zero
+//! config; Gemini `generateContent` (BYOK) is the real path. Per-task model is
+//! read from settings as `model_<task>` = "provider:model" (e.g. "gemini:gemini-2.5-flash").
+
+use crate::error::{Error, Result};
+use base64::{engine::general_purpose::STANDARD, Engine};
+
+pub trait Llm: Send + Sync {
+    fn complete(&self, system: &str, user: &str) -> Result<String>;
+    /// Low-latency plain-text completion for disposable UI previews. Providers
+    /// may bypass reasoning-oriented chat templates; other providers reuse the
+    /// ordinary completion path.
+    fn complete_fast(&self, system: &str, user: &str) -> Result<String> {
+        self.complete(system, user)
+    }
+    /// Complete a request whose caller requires a JSON value. Providers that
+    /// expose a native structured-output switch override this; the default keeps
+    /// providers without such a switch compatible with the existing prompt-only
+    /// contract.
+    fn complete_json(&self, system: &str, user: &str) -> Result<String> {
+        self.complete(system, user)
+    }
+    /// Translate one live-caption fragment. Translation-specialized providers
+    /// can override this without forcing their model-specific prompt contract
+    /// through the generic system/user chat interface.
+    fn translate_caption(
+        &self,
+        system: &str,
+        text: &str,
+        _target: &str,
+        context: &str,
+        draft: bool,
+    ) -> Result<String> {
+        let user = if draft {
+            text.trim().to_string()
+        } else {
+            serde_json::json!({
+                "previous_transcript": context.trim(),
+                "current_subtitle": text.trim(),
+            })
+            .to_string()
+        };
+        if draft {
+            self.complete_fast(system, &user)
+        } else {
+            self.complete(system, &user)
+        }
+    }
+    fn name(&self) -> String;
+    /// Cap output tokens for this provider's request. Wiring the per-task token
+    /// budget here is what stops OpenRouter from defaulting to a huge max_tokens
+    /// (its model default) and 402-ing when the key's credit limit can't cover it.
+    /// Default: no-op (providers that don't store it ignore the cap).
+    fn set_max_tokens(&mut self, _max: u32) {}
+    /// OCR/transcribe images (each `(mime, base64)`) to Markdown text. Default:
+    /// unsupported — only vision-capable providers override this.
+    fn ocr(&self, _images: &[(String, String)]) -> Result<String> {
+        Err(Error::Unsupported(format!(
+            "{} can't read images — pick a vision model (e.g. an OpenRouter/Gemini multimodal model) in Settings",
+            self.name()
+        )))
+    }
+}
+
+/// Standard base64 (with padding) for OCR data URLs and inline image payloads.
+pub fn b64_encode(data: &[u8]) -> String {
+    STANDARD.encode(data)
+}
+
+const OCR_PROMPT: &str = "Transcribe ALL text in these page image(s) EXACTLY, in reading order — \
+including HANDWRITTEN text (photographed notes, whiteboards): transcribe messy writing as \
+faithfully as you can and mark genuinely unreadable words as [illegible]. \
+Preserve headings, lists, tables (as Markdown tables), and math. Do not summarise, \
+translate, or add commentary — output ONLY the transcribed text as Markdown.";
+
+/// Offline placeholder — no network, no key. Produces something usable so the
+/// UI flow works, while telling the user to connect a model for real output.
+#[allow(dead_code)]
+pub struct StubLlm;
+
+impl Llm for StubLlm {
+    fn complete(&self, _system: &str, user: &str) -> Result<String> {
+        let preview: String = user.chars().take(280).collect();
+        Ok(format!(
+            "[Offline draft — connect a model in Settings → API keys for real generation.]\n\n\
+             Based on the provided sources:\n{preview}…"
+        ))
+    }
+    fn name(&self) -> String {
+        "stub".into()
+    }
+}
+
+/// Google Gemini `generateContent` (BYOK).
+pub struct GeminiLlm {
+    pub api_key: String,
+    pub model: String,
+    pub max_tokens: Option<u32>,
+}
+
+impl Llm for GeminiLlm {
+    fn set_max_tokens(&mut self, max: u32) {
+        self.max_tokens = Some(max);
+    }
+    fn complete(&self, system: &str, user: &str) -> Result<String> {
+        let client = llm_client();
+        let url = format!(
+            "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
+            self.model, self.api_key
+        );
+        // Gemini 2.5 models reason with hidden "thinking" tokens that draw from
+        // the SAME maxOutputTokens budget. A small budget is routinely exhausted
+        // by thinking before any answer text is emitted, leaving an empty
+        // response with a MAX_TOKENS finishReason — the real cause of
+        // "generation doesn't work at all" for cheatsheet/material.
+        // Two defenses: a roomy budget, and — for flash models, which allow it —
+        // disable thinking entirely so every token goes to the actual output.
+        // (gemini-2.5-pro rejects thinkingBudget:0, so only set it for flash.)
+        // Roomy output budget: a full 7-section cheatsheet (or a merged subject
+        // digest) easily exceeds a small cap, and the model would otherwise stop
+        // mid-answer — e.g. a table cut off halfway. 2.5 models support 65536.
+        let mut generation_config = serde_json::json!({
+            "temperature": 0.3,
+            "maxOutputTokens": self.max_tokens.unwrap_or(65536)
+        });
+        if self.model.contains("flash") {
+            generation_config["thinkingConfig"] = serde_json::json!({ "thinkingBudget": 0 });
+        }
+        let body = serde_json::json!({
+            "system_instruction": { "parts": [{ "text": system }] },
+            "contents": [{ "role": "user", "parts": [{ "text": user }] }],
+            "generationConfig": generation_config
+        });
+        let json = send_json("gemini", client.post(&url).json(&body))?;
+        // Concatenate every text part (some responses split across parts).
+        let text: String = json["candidates"][0]["content"]["parts"]
+            .as_array()
+            .map(|parts| {
+                parts
+                    .iter()
+                    .filter_map(|p| p["text"].as_str())
+                    .collect::<String>()
+            })
+            .unwrap_or_default();
+        if text.is_empty() {
+            // Surface the finishReason (e.g. MAX_TOKENS / SAFETY) so the failure
+            // is diagnosable instead of an opaque "empty response".
+            let reason = json["candidates"][0]["finishReason"]
+                .as_str()
+                .unwrap_or("unknown");
+            return Err(Error::Other(format!(
+                "gemini: empty response (finishReason={reason}). \
+                 If MAX_TOKENS, the model spent its budget on reasoning — try a flash model."
+            )));
+        }
+        Ok(text)
+    }
+    fn name(&self) -> String {
+        format!("gemini:{}", self.model)
+    }
+    fn ocr(&self, images: &[(String, String)]) -> Result<String> {
+        let client = llm_client();
+        let url = format!(
+            "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
+            self.model, self.api_key
+        );
+        let mut parts = vec![serde_json::json!({ "text": OCR_PROMPT })];
+        for (mime, b64) in images {
+            parts.push(serde_json::json!({ "inline_data": { "mime_type": mime, "data": b64 } }));
+        }
+        let body = serde_json::json!({
+            "contents": [{ "role": "user", "parts": parts }],
+            "generationConfig": { "temperature": 0.0, "maxOutputTokens": 8192 }
+        });
+        let json = send_json("gemini", client.post(&url).json(&body))?;
+        Ok(json["candidates"][0]["content"]["parts"]
+            .as_array()
+            .map(|ps| {
+                ps.iter()
+                    .filter_map(|p| p["text"].as_str())
+                    .collect::<String>()
+            })
+            .unwrap_or_default())
+    }
+}
+
+fn truncate(s: &str, n: usize) -> String {
+    s.chars().take(n).collect()
+}
+
+/// Pull the affordable token count out of an OpenRouter 402 message, e.g.
+/// "...you requested up to 64000 tokens, but can only afford 55765." Returns the
+/// last number after "afford" so we can retry within the key's credit limit.
+fn parse_affordable(msg: &str) -> Option<u32> {
+    let idx = msg.find("afford")?;
+    let tail = &msg[idx..];
+    let digits: String = tail
+        .chars()
+        .skip_while(|c| !c.is_ascii_digit())
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    digits.parse::<u32>().ok().filter(|n| *n > 0)
+}
+
+/// Shared blocking HTTP client for LLM calls: a generous request timeout (model
+/// generation can be slow) so a stalled connection fails cleanly instead of
+/// hanging forever.
+fn llm_client() -> reqwest::blocking::Client {
+    // Force identity (uncompressed) transfer encoding. OpenRouter streams a gzip
+    // body padded with whitespace keep-alives during slow generation, which
+    // reqwest's automatic gzip decoder fails to decode — surfacing as the opaque
+    // "error decoding response body" that broke cheatsheet/material generation.
+    // Setting Accept-Encoding ourselves ALSO disables reqwest's auto-decompress,
+    // so the body is read verbatim regardless of what the server sends.
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        reqwest::header::ACCEPT_ENCODING,
+        reqwest::header::HeaderValue::from_static("identity"),
+    );
+    reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(300))
+        .default_headers(headers)
+        .build()
+        .unwrap_or_default()
+}
+
+/// Send a request, then read its body as text and parse it as JSON — with
+/// retries on TRANSIENT transport failures. Long LLM generations behind proxies
+/// (notably OpenRouter, which streams whitespace keep-alives during slow
+/// generation) occasionally drop the connection mid-body; reqwest surfaces that
+/// as the opaque "error decoding response body". A couple of retries recover it.
+/// Non-2xx responses and JSON-parse failures are returned verbatim (with the
+/// body for diagnosis) and are NOT retried. Reading as text (not `resp.json()`)
+/// keeps errors diagnosable instead of opaque.
+fn send_json(provider: &str, req: reqwest::blocking::RequestBuilder) -> Result<serde_json::Value> {
+    let transient = |e: &reqwest::Error| {
+        e.is_timeout() || e.is_connect() || e.is_request() || e.is_body() || e.is_decode()
+    };
+    let mut attempt = 0u32;
+    loop {
+        attempt += 1;
+        let this = req
+            .try_clone()
+            .ok_or_else(|| Error::Other(format!("{provider}: request could not be retried")))?;
+        let resp = match this.send() {
+            Ok(r) => r,
+            Err(e) if attempt < 3 && transient(&e) => {
+                std::thread::sleep(std::time::Duration::from_millis(800 * attempt as u64));
+                continue;
+            }
+            Err(e) => return Err(e.into()),
+        };
+        let status = resp.status();
+        let raw = match resp.text() {
+            Ok(t) => t,
+            Err(e) if attempt < 3 && transient(&e) => {
+                std::thread::sleep(std::time::Duration::from_millis(800 * attempt as u64));
+                continue;
+            }
+            Err(e) => {
+                return Err(Error::Other(format!(
+                    "{provider}: could not read response body: {e}"
+                )))
+            }
+        };
+        if !status.is_success() {
+            return Err(Error::Other(format!(
+                "{provider} {status}: {}",
+                truncate(raw.trim(), 300)
+            )));
+        }
+        match serde_json::from_str(&raw) {
+            Ok(v) => return Ok(v),
+            // A successful (2xx) response that doesn't parse is almost always a
+            // TRUNCATED body (connection cut mid-stream during a long/large
+            // generation — e.g. OCR with big images). Retry rather than fail.
+            Err(_) if attempt < 3 => {
+                std::thread::sleep(std::time::Duration::from_millis(800 * attempt as u64));
+                continue;
+            }
+            Err(e) => {
+                return Err(Error::Other(format!(
+                    "{provider}: response was not valid JSON ({e}): {}",
+                    truncate(raw.trim(), 300)
+                )))
+            }
+        }
+    }
+}
+
+/// OpenAI-compatible chat provider — used for OpenRouter and OpenAI (and any
+/// custom OpenAI-compatible gateway). One code path, different base URL/key.
+pub struct OpenAiCompatLlm {
+    pub base_url: String,
+    pub api_key: String,
+    pub model: String,
+    pub label: &'static str,
+    pub max_tokens: Option<u32>,
+}
+
+fn openai_chat_body(
+    model: &str,
+    system: &str,
+    user: &str,
+    max_tokens: Option<u32>,
+    json_mode: bool,
+) -> serde_json::Value {
+    let mut body = serde_json::json!({
+        "model": model,
+        "messages": [
+            { "role": "system", "content": system },
+            { "role": "user", "content": user }
+        ],
+        "temperature": 0.3
+    });
+    if let Some(n) = max_tokens {
+        body["max_tokens"] = serde_json::json!(n);
+    }
+    if json_mode {
+        body["response_format"] = serde_json::json!({ "type": "json_object" });
+    }
+    body
+}
+
+fn known_output_limit(model: &str) -> Option<u32> {
+    match model.rsplit('/').next().unwrap_or(model) {
+        "gpt-4o-mini" | "gpt-4o-mini-2024-07-18" => Some(16_384),
+        _ => None,
+    }
+}
+
+fn rejects_json_response_format(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    let incompatible_request = lower.contains(" 400 ") || lower.contains(" 422 ");
+    let structured_output_field = lower.contains("response_format")
+        || lower.contains("response format")
+        || lower.contains("json mode")
+        || lower.contains("json_object");
+    incompatible_request && structured_output_field
+}
+
+fn uses_translategemma_completion(label: &str, model: &str) -> bool {
+    matches!(label, "lmstudio" | "custom") && model.to_ascii_lowercase().contains("translategemma")
+}
+
+fn escape_model_control_tokens(text: &str) -> String {
+    [
+        ("<start_of_turn>", "< start_of_turn >"),
+        ("<end_of_turn>", "< end_of_turn >"),
+        ("<bos>", "< bos >"),
+        ("<eos>", "< eos >"),
+        ("<|", "< |"),
+    ]
+    .into_iter()
+    .fold(text.to_string(), |safe, (token, escaped)| {
+        safe.replace(token, escaped)
+    })
+}
+
+fn translategemma_language_pair(
+    target: &str,
+) -> Result<(&'static str, &'static str, &'static str, &'static str)> {
+    match target {
+        "zh-CN" | "zh-Hans" => Ok(("English", "en", "Chinese", "zh-Hans")),
+        "en" => Ok(("Chinese", "zh-Hans", "English", "en")),
+        _ => Err(Error::Other(format!(
+            "TranslateGemma does not support Linye target language: {target}"
+        ))),
+    }
+}
+
+fn translategemma_completion_body(
+    model: &str,
+    text: &str,
+    target: &str,
+    context: &str,
+    draft: bool,
+    max_tokens: Option<u32>,
+) -> Result<serde_json::Value> {
+    let (source_name, source_code, target_name, target_code) =
+        translategemma_language_pair(target)?;
+    let safe_text = escape_model_control_tokens(text.trim());
+    let safe_context = escape_model_control_tokens(context.trim());
+    let phase_instruction = if draft {
+        "This may be an incomplete live speech fragment. Translate only the supplied fragment naturally and do not invent missing words.\n"
+            .to_string()
+    } else if safe_context.is_empty() {
+        "Translate only the current text.\n".to_string()
+    } else {
+        format!(
+            "Use the previous transcript only to resolve pronouns, terminology, and continuity. Do not translate or output the previous transcript. Translate only the current text.\n\nPrevious transcript context (reference only):\n{safe_context}\n\n"
+        )
+    };
+    let prompt = format!(
+        "<bos><start_of_turn>user\nYou are a professional {source_name} ({source_code}) to {target_name} ({target_code}) translator. Your goal is to accurately convey the meaning and nuances of the original {source_name} text while adhering to {target_name} grammar, vocabulary, and cultural sensitivities.\n{phase_instruction}If the supplied text is already in {target_name}, return it unchanged. Produce only the {target_name} translation, without any additional explanations or commentary. Please translate the following {source_name} text into {target_name}:\n\n\n{safe_text}<end_of_turn>\n<start_of_turn>model\n"
+    );
+    Ok(serde_json::json!({
+        "model": model,
+        "prompt": prompt,
+        "temperature": 0,
+        "max_tokens": max_tokens.unwrap_or(256),
+        "stop": ["<end_of_turn>", "<eos>"]
+    }))
+}
+
+fn parse_plain_completion(provider: &str, json: &serde_json::Value) -> Result<String> {
+    if matches!(
+        json["choices"][0]["finish_reason"].as_str(),
+        Some("length" | "max_tokens")
+    ) {
+        return Err(Error::Other(format!(
+            "{provider}: response hit the output-token limit"
+        )));
+    }
+    json["choices"][0]["text"]
+        .as_str()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| Error::Other(format!("{provider}: empty response")))
+}
+
+impl OpenAiCompatLlm {
+    /// One chat/completions attempt with an explicit max_tokens (or none).
+    fn complete_once(
+        &self,
+        system: &str,
+        user: &str,
+        max_tokens: Option<u32>,
+        json_mode: bool,
+    ) -> Result<String> {
+        let key = self.api_key.trim();
+        let client = llm_client();
+        let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
+        let body = openai_chat_body(&self.model, system, user, max_tokens, json_mode);
+        let mut request = client
+            .post(&url)
+            // OpenRouter likes these; harmless elsewhere.
+            .header("HTTP-Referer", "https://cortex.study")
+            .header("X-Title", "Cortex");
+        if !key.is_empty() {
+            request = request.header("Authorization", format!("Bearer {key}"));
+        }
+        let json = send_json(self.label, request.json(&body))?;
+        if matches!(
+            json["choices"][0]["finish_reason"].as_str(),
+            Some("length" | "max_tokens")
+        ) {
+            return Err(Error::Other(format!(
+                "{}: response hit the output-token limit; increase this task's token budget or use a model with a larger output window",
+                self.label
+            )));
+        }
+        json["choices"][0]["message"]["content"]
+            .as_str()
+            .map(|s| s.to_string())
+            .ok_or_else(|| Error::Other(format!("{}: empty response", self.label)))
+    }
+
+    fn complete_with_mode(&self, system: &str, user: &str, json_mode: bool) -> Result<String> {
+        let key = self.api_key.trim();
+        if key.is_empty()
+            && self.label != "custom"
+            && self.label != "lmstudio"
+            && self.label != "ollama"
+        {
+            return Err(Error::Other(format!(
+                "{}: API key is empty — paste it in Settings → API keys and click Save keys.",
+                self.label
+            )));
+        }
+        match self.complete_once(system, user, self.max_tokens, json_mode) {
+            Ok(t) => Ok(t),
+            // OpenRouter returns 402 with "...can only afford N" when the key's
+            // credit limit can't cover the requested max_tokens. Retry once with
+            // the affordable amount so generation succeeds instead of hard-failing.
+            Err(Error::Other(msg)) if msg.contains("402") => {
+                if let Some(afford) = parse_affordable(&msg) {
+                    let retry = afford.saturating_sub(512).max(256);
+                    return self.complete_once(system, user, Some(retry), json_mode);
+                }
+                Err(Error::Other(msg))
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    fn complete_qwen3_without_reasoning(&self, system: &str, user: &str) -> Result<String> {
+        let safe_user = user.replace("<|", "< |");
+        let prompt = format!(
+            "<|im_start|>system\n{system}<|im_end|>\n<|im_start|>user\n{safe_user}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+        );
+        let body = serde_json::json!({
+            "model": self.model,
+            "prompt": prompt,
+            "temperature": 0,
+            "max_tokens": self.max_tokens.unwrap_or(256),
+            "stop": ["<|im_end|>"]
+        });
+        let url = format!("{}/completions", self.base_url.trim_end_matches('/'));
+        let key = self.api_key.trim();
+        let client = llm_client();
+        let mut request = client.post(&url);
+        if !key.is_empty() {
+            request = request.header("Authorization", format!("Bearer {key}"));
+        }
+        let json = send_json(self.label, request.json(&body))?;
+        parse_plain_completion(self.label, &json)
+    }
+
+    fn complete_translategemma(
+        &self,
+        text: &str,
+        target: &str,
+        context: &str,
+        draft: bool,
+    ) -> Result<String> {
+        let body = translategemma_completion_body(
+            &self.model,
+            text,
+            target,
+            context,
+            draft,
+            self.max_tokens,
+        )?;
+        let url = format!("{}/completions", self.base_url.trim_end_matches('/'));
+        let key = self.api_key.trim();
+        let client = llm_client();
+        let mut request = client.post(&url);
+        if !key.is_empty() {
+            request = request.header("Authorization", format!("Bearer {key}"));
+        }
+        let json = send_json(self.label, request.json(&body))?;
+        parse_plain_completion(self.label, &json)
+    }
+}
+
+impl Llm for OpenAiCompatLlm {
+    fn set_max_tokens(&mut self, max: u32) {
+        self.max_tokens = Some(known_output_limit(&self.model).map_or(max, |limit| max.min(limit)));
+    }
+    fn complete(&self, system: &str, user: &str) -> Result<String> {
+        self.complete_with_mode(system, user, false)
+    }
+    fn complete_fast(&self, system: &str, user: &str) -> Result<String> {
+        let model = self.model.to_ascii_lowercase();
+        if matches!(self.label, "lmstudio" | "custom")
+            && (model.contains("qwen3.5") || model.contains("qwen3.8"))
+        {
+            self.complete_qwen3_without_reasoning(system, user)
+        } else {
+            self.complete(system, user)
+        }
+    }
+    fn translate_caption(
+        &self,
+        system: &str,
+        text: &str,
+        target: &str,
+        context: &str,
+        draft: bool,
+    ) -> Result<String> {
+        if uses_translategemma_completion(self.label, &self.model) {
+            self.complete_translategemma(text, target, context, draft)
+        } else {
+            let user = if draft {
+                text.trim().to_string()
+            } else {
+                serde_json::json!({
+                    "previous_transcript": context.trim(),
+                    "current_subtitle": text.trim(),
+                })
+                .to_string()
+            };
+            if draft {
+                self.complete_fast(system, &user)
+            } else {
+                self.complete(system, &user)
+            }
+        }
+    }
+    fn complete_json(&self, system: &str, user: &str) -> Result<String> {
+        match self.complete_with_mode(system, user, true) {
+            Ok(t) => Ok(t),
+            // OpenAI-compatible servers vary in how they report an unsupported
+            // structured-output option. Retry without it only when a 400/422
+            // response identifies the JSON response-format field.
+            Err(Error::Other(msg)) if rejects_json_response_format(&msg) => {
+                self.complete_with_mode(system, user, false)
+            }
+            Err(e) => Err(e),
+        }
+    }
+    fn name(&self) -> String {
+        format!("{}:{}", self.label, self.model)
+    }
+    fn ocr(&self, images: &[(String, String)]) -> Result<String> {
+        let key = self.api_key.trim();
+        if key.is_empty() {
+            return Err(Error::Other(format!("{}: API key is empty", self.label)));
+        }
+        let client = llm_client();
+        let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
+        let mut content = vec![serde_json::json!({ "type": "text", "text": OCR_PROMPT })];
+        for (mime, b64) in images {
+            content.push(serde_json::json!({
+                "type": "image_url",
+                "image_url": { "url": format!("data:{mime};base64,{b64}") }
+            }));
+        }
+        let body = serde_json::json!({
+            "model": self.model,
+            "messages": [{ "role": "user", "content": content }],
+            "temperature": 0.0
+        });
+        let json = send_json(
+            self.label,
+            client
+                .post(&url)
+                .header("Authorization", format!("Bearer {key}"))
+                .header("HTTP-Referer", "https://cortex.study")
+                .header("X-Title", "Cortex")
+                .json(&body),
+        )?;
+        Ok(json["choices"][0]["message"]["content"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string())
+    }
+}
+
+/// Anthropic Claude Messages API (BYOK).
+pub struct ClaudeLlm {
+    pub api_key: String,
+    pub model: String,
+    pub max_tokens: Option<u32>,
+}
+
+impl Llm for ClaudeLlm {
+    fn set_max_tokens(&mut self, max: u32) {
+        self.max_tokens = Some(max);
+    }
+    fn complete(&self, system: &str, user: &str) -> Result<String> {
+        let client = llm_client();
+        let body = serde_json::json!({
+            "model": self.model,
+            // Roomy enough for a full cheatsheet without cutting off mid-section.
+            // Modern Claude models support far more (Sonnet 4.x: 64K, Opus: 128K
+            // output tokens); 32K covers any cheatsheet while staying within limits.
+            "max_tokens": self.max_tokens.unwrap_or(32000),
+            "temperature": 0.3,
+            "system": system,
+            "messages": [{ "role": "user", "content": user }]
+        });
+        let json = send_json(
+            "claude",
+            client
+                .post("https://api.anthropic.com/v1/messages")
+                .header("x-api-key", &self.api_key)
+                .header("anthropic-version", "2023-06-01")
+                .json(&body),
+        )?;
+        let text = json["content"][0]["text"]
+            .as_str()
+            .ok_or_else(|| Error::Other("claude: empty response".into()))?
+            .to_string();
+        Ok(text)
+    }
+    fn name(&self) -> String {
+        format!("claude:{}", self.model)
+    }
+}
+
+/// API keys available from settings.
+#[derive(Default)]
+pub struct Keys {
+    pub offline: bool,
+    pub gemini: Option<String>,
+    pub openrouter: Option<String>,
+    pub openai: Option<String>,
+    pub claude: Option<String>,
+    pub custom_api_key: Option<String>,
+    pub custom_endpoint: Option<String>,
+    /// LM Studio's OpenAI-compatible base URL (normally http://host:1234/v1).
+    pub lmstudio_url: Option<String>,
+    /// Optional when LM Studio authentication is disabled.
+    pub lmstudio_api_key: Option<String>,
+    /// Ollama base URL (e.g. http://localhost:11434) — local, keyless.
+    pub ollama_url: Option<String>,
+}
+
+fn nonempty(o: &Option<String>) -> Option<&str> {
+    o.as_deref().filter(|s| !s.is_empty())
+}
+
+fn loopback_url(value: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(value) else {
+        return false;
+    };
+    let host = url.host_str().unwrap_or("").trim_matches(['[', ']']);
+    matches!(url.scheme(), "http" | "https")
+        && (host == "localhost"
+            || host
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback()))
+}
+
+/// Build an LLM from a "provider:model" spec + the available keys. Returns
+/// `None` when no usable provider/key is configured — callers turn that into a
+/// clear "add an API key" error instead of silently producing fake output.
+pub fn from_spec(spec: &str, keys: &Keys) -> Option<Box<dyn Llm>> {
+    // Trim — a stored spec with stray whitespace/newline would otherwise produce
+    // an invalid model id (and thus a provider error).
+    let spec = spec.trim();
+    let (provider, model) = spec.split_once(':').unwrap_or(("gemini", spec));
+    if keys.offline {
+        let base = match provider {
+            "ollama" => nonempty(&keys.ollama_url).unwrap_or("http://localhost:11434"),
+            "lmstudio" => nonempty(&keys.lmstudio_url)?,
+            _ => return None,
+        };
+        if !loopback_url(base) {
+            return None;
+        }
+    }
+    let model = model.trim().to_string();
+    match provider {
+        "gemini" => nonempty(&keys.gemini).map(|k| {
+            Box::new(GeminiLlm {
+                api_key: k.to_string(),
+                model,
+                max_tokens: None,
+            }) as Box<dyn Llm>
+        }),
+        "openrouter" => nonempty(&keys.openrouter).map(|k| {
+            Box::new(OpenAiCompatLlm {
+                base_url: "https://openrouter.ai/api/v1".into(),
+                api_key: k.to_string(),
+                model,
+                label: "openrouter",
+                max_tokens: None,
+            }) as Box<dyn Llm>
+        }),
+        "openai" => nonempty(&keys.openai).map(|k| {
+            Box::new(OpenAiCompatLlm {
+                base_url: "https://api.openai.com/v1".into(),
+                api_key: k.to_string(),
+                model,
+                label: "openai",
+                max_tokens: None,
+            }) as Box<dyn Llm>
+        }),
+        "claude" | "anthropic" => nonempty(&keys.claude).map(|k| {
+            Box::new(ClaudeLlm {
+                api_key: k.to_string(),
+                model,
+                max_tokens: None,
+            }) as Box<dyn Llm>
+        }),
+        "custom" => nonempty(&keys.custom_endpoint).map(|base| {
+            Box::new(OpenAiCompatLlm {
+                base_url: base.to_string(),
+                api_key: nonempty(&keys.custom_api_key).unwrap_or("").to_string(),
+                model,
+                label: "custom",
+                max_tokens: None,
+            }) as Box<dyn Llm>
+        }),
+        "lmstudio" => nonempty(&keys.lmstudio_url).map(|base| {
+            let base = base.trim_end_matches('/');
+            let base_url = if base.ends_with("/v1") {
+                base.to_string()
+            } else {
+                format!("{base}/v1")
+            };
+            Box::new(OpenAiCompatLlm {
+                base_url,
+                api_key: nonempty(&keys.lmstudio_api_key).unwrap_or("").to_string(),
+                model,
+                label: "lmstudio",
+                max_tokens: None,
+            }) as Box<dyn Llm>
+        }),
+        // Ollama exposes an OpenAI-compatible API at <base>/v1; it's keyless, so
+        // pass a dummy bearer token (Ollama ignores it).
+        "ollama" => {
+            let base = nonempty(&keys.ollama_url).unwrap_or("http://localhost:11434");
+            Some(Box::new(OpenAiCompatLlm {
+                base_url: format!("{}/v1", base.trim_end_matches('/')),
+                api_key: "ollama".to_string(),
+                model,
+                label: "ollama",
+                max_tokens: None,
+            }) as Box<dyn Llm>)
+        }
+        _ => None,
+    }
+}
+
+/// Like `from_spec`, but if the configured spec's provider has no key, fall back
+/// to whichever provider DOES have a key. This lets generation work as soon as
+/// ANY API key is set, even if a per-task model still points at an unkeyed
+/// provider (the common "I added my OpenRouter key but cheatsheet still says no
+/// model" case — cheatsheet defaulted to gemini).
+pub fn from_spec_or_any(spec: &str, keys: &Keys) -> Option<Box<dyn Llm>> {
+    if let Some(m) = from_spec(spec, keys) {
+        return Some(m);
+    }
+    if keys.offline {
+        return None;
+    }
+    let fallback = if nonempty(&keys.openrouter).is_some() {
+        "openrouter:deepseek/deepseek-v4-flash"
+    } else if nonempty(&keys.gemini).is_some() {
+        "gemini:gemini-2.5-flash"
+    } else if nonempty(&keys.openai).is_some() {
+        "openai:gpt-4o-mini"
+    } else if nonempty(&keys.claude).is_some() {
+        "claude:claude-3-5-sonnet-20241022"
+    } else if nonempty(&keys.custom_endpoint).is_some() {
+        "custom:default"
+    } else if nonempty(&keys.lmstudio_url).is_some() {
+        "lmstudio:default"
+    } else {
+        return None;
+    };
+    from_spec(fallback, keys)
+}
+
+/// Extract the first JSON value (object or array) from an LLM reply that may be
+/// wrapped in prose or ```json fences.
+///
+/// Robustness: we DON'T rely on a strict brace-matcher to find the closing
+/// delimiter, because an unescaped `"` inside a rich-markdown string value
+/// desyncs the in-string tracking and truncates the slice. Instead we bound the
+/// JSON as `first opener .. last matching closer` (LLMs emit a single JSON value,
+/// optionally followed by prose that rarely contains a stray `}`/`]`) and hand
+/// the slice to `parse_lenient`, which repairs the common invalid-JSON shapes.
+pub fn extract_json(text: &str) -> Result<serde_json::Value> {
+    let t = text.trim();
+    // strip a leading code fence
+    let t = t
+        .strip_prefix("```json")
+        .or_else(|| t.strip_prefix("```"))
+        .unwrap_or(t);
+    let t = t.trim_start_matches("```").trim();
+
+    let start = match t.find(['{', '[']) {
+        Some(s) => s,
+        None => return Err(Error::Other("no JSON found in LLM reply".into())),
+    };
+    let open = t.as_bytes()[start] as char;
+    let close = if open == '{' { '}' } else { ']' };
+    let end = t.rfind(close).filter(|&e| e > start);
+    if let Some(end) = end {
+        let slice = &t[start..=end];
+        if let Ok(v) = parse_lenient(slice) {
+            return Ok(v);
+        }
+    }
+    // Fallback: repair from the opener to the end of the text (handles a missing
+    // closer or trailing-prose confusion).
+    parse_lenient(&t[start..])
+}
+
+/// Parse a JSON slice, retrying once with a repair pass. LLMs producing rich
+/// content (tables, callouts, multi-line explanations) routinely emit invalid
+/// JSON inside string values — LITERAL newlines/tabs and UNESCAPED double quotes
+/// — which was the cause of "Model returned unstructured output" for rich
+/// cheatsheets. The repair pass fixes both.
+fn parse_lenient(slice: &str) -> Result<serde_json::Value> {
+    match serde_json::from_str(slice) {
+        Ok(v) => Ok(v),
+        Err(_) => Ok(serde_json::from_str(&repair_json(slice))?),
+    }
+}
+
+/// Repair the two invalid-JSON shapes LLMs emit inside string literals:
+///
+/// 1. Raw control characters (newline, CR, tab, other <0x20) → escaped.
+/// 2. Unescaped interior double quotes → escaped to `\"`.
+///
+/// In the second case, a `"` is treated as the string's closer only when the next
+/// non-whitespace character is structural (`:` `,` `}` `]`) or end-of-input;
+/// otherwise it's interior content and gets escaped. Already-escaped sequences
+/// and structure outside strings are left untouched. The heuristic can't cover a
+/// quoted phrase that ends immediately before a comma, but it fixes the common
+/// cases and is strictly more tolerant than escaping control chars alone.
+fn repair_json(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let n = chars.len();
+    let mut out = String::with_capacity(s.len() + 16);
+    let mut in_str = false;
+    let mut esc = false;
+    let mut i = 0;
+    while i < n {
+        let ch = chars[i];
+        if in_str {
+            if esc {
+                out.push(ch);
+                esc = false;
+            } else if ch == '\\' {
+                out.push(ch);
+                esc = true;
+            } else if ch == '"' {
+                let mut j = i + 1;
+                while j < n && chars[j].is_whitespace() {
+                    j += 1;
+                }
+                let closes = match chars.get(j) {
+                    None => true,
+                    Some(&c) => matches!(c, ':' | ',' | '}' | ']'),
+                };
+                if closes {
+                    out.push('"');
+                    in_str = false;
+                } else {
+                    out.push_str("\\\"");
+                }
+            } else {
+                match ch {
+                    '\n' => out.push_str("\\n"),
+                    '\r' => out.push_str("\\r"),
+                    '\t' => out.push_str("\\t"),
+                    c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+                    c => out.push(c),
+                }
+            }
+        } else {
+            if ch == '"' {
+                in_str = true;
+            }
+            out.push(ch);
+        }
+        i += 1;
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ocr_base64_keeps_standard_alphabet_and_padding() {
+        for (input, expected) in [
+            (b"".as_slice(), ""),
+            (b"f".as_slice(), "Zg=="),
+            (b"fo".as_slice(), "Zm8="),
+            (b"foo".as_slice(), "Zm9v"),
+            (b"\x00\xff\x80".as_slice(), "AP+A"),
+        ] {
+            assert_eq!(b64_encode(input), expected);
+        }
+    }
+
+    #[test]
+    fn extract_json_from_fenced_prose() {
+        let reply = "Sure! Here it is:\n```json\n{\"sections\":[{\"title\":\"Defs\",\"items\":[]}]}\n```\nDone.";
+        let v = extract_json(reply).unwrap();
+        assert_eq!(v["sections"][0]["title"], "Defs");
+    }
+
+    #[test]
+    fn extract_json_array() {
+        let v = extract_json("[{\"q\":\"a\",\"a\":\"b\"}]").unwrap();
+        assert_eq!(v[0]["q"], "a");
+    }
+
+    #[test]
+    fn extract_json_fenced_array_with_trailing_prose() {
+        // The common "wrapped in ```json + closing prose" failure shape.
+        let reply = "```json\n[{\"q\":\"x\",\"a\":\"y\"}]\n```\nHope this helps!";
+        let v = extract_json(reply).unwrap();
+        assert_eq!(v[0]["a"], "y");
+    }
+
+    #[test]
+    fn extract_json_repairs_literal_newlines_in_strings() {
+        // Rich cheatsheet content: a `d` value with literal newlines and a tab is
+        // invalid JSON until the repair pass escapes those characters.
+        let reply = "{\"sections\":[{\"title\":\"T\",\"items\":[{\"t\":\"Term\",\"d\":\"Line one\n> [!NOTE]\nLine two\twith tab\"}]}]}";
+        let v = extract_json(reply).unwrap();
+        assert_eq!(v["sections"][0]["items"][0]["t"], "Term");
+        assert!(v["sections"][0]["items"][0]["d"]
+            .as_str()
+            .unwrap()
+            .contains("NOTE"));
+    }
+
+    // Live diagnostic (ignored by default). Run with the real key to see exactly
+    // what the OpenRouter call returns through the app's own client:
+    //   OPENROUTER_KEY=sk-or-... cargo test --lib live_openrouter -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn live_openrouter() {
+        let key = std::env::var("OPENROUTER_KEY").expect("set OPENROUTER_KEY");
+        let llm = OpenAiCompatLlm {
+            base_url: "https://openrouter.ai/api/v1".into(),
+            api_key: key,
+            model: "google/gemini-2.5-flash".into(),
+            label: "openrouter",
+            max_tokens: None,
+        };
+        match llm.complete(
+            "You output JSON only.",
+            "Return {\"ok\":true} and nothing else.",
+        ) {
+            Ok(t) => println!("LIVE OK: {}", truncate(&t, 200)),
+            Err(e) => println!("LIVE ERR: {e}"),
+        }
+    }
+
+    #[test]
+    fn extract_json_repairs_unescaped_interior_quotes() {
+        // Rich cheatsheet content where the model omitted escapes around an
+        // interior quoted phrase.
+        let reply = "{\"sections\":[{\"title\":\"Defs\",\"items\":[{\"t\":\"Place\",\"d\":\"A \"place\" is a location with meaning.\"}]}]}";
+        let v = extract_json(reply).unwrap();
+        assert_eq!(v["sections"][0]["items"][0]["t"], "Place");
+        assert!(v["sections"][0]["items"][0]["d"]
+            .as_str()
+            .unwrap()
+            .contains("place"));
+    }
+
+    #[test]
+    fn extract_json_repairs_quotes_and_newlines_together() {
+        // Both failure shapes at once inside one rich body.
+        let reply = "Here:\n{\"sections\":[{\"title\":\"T\",\"items\":[{\"t\":\"X\",\"d\":\"Line one\nHe said \"hi\" here\"}]}]}\nDone.";
+        let v = extract_json(reply).unwrap();
+        let d = v["sections"][0]["items"][0]["d"].as_str().unwrap();
+        assert!(d.contains("hi"));
+        assert!(d.contains("Line one"));
+    }
+
+    #[test]
+    fn stub_is_offline_safe() {
+        let s = StubLlm;
+        let out = s.complete("sys", "hello world").unwrap();
+        assert!(out.contains("Offline draft"));
+    }
+
+    #[test]
+    fn openai_structured_chat_requests_json_object_output() {
+        let structured = openai_chat_body("model", "system", "user", Some(32_000), true);
+        assert_eq!(structured["response_format"]["type"], "json_object");
+        assert_eq!(structured["max_tokens"], 32_000);
+
+        let ordinary = openai_chat_body("model", "system", "user", None, false);
+        assert!(ordinary.get("response_format").is_none());
+    }
+
+    #[test]
+    fn known_model_output_limit_caps_an_oversized_budget() {
+        let mut model = OpenAiCompatLlm {
+            base_url: "https://api.openai.com/v1".into(),
+            api_key: "test".into(),
+            model: "gpt-4o-mini".into(),
+            label: "openai",
+            max_tokens: None,
+        };
+        model.set_max_tokens(32_000);
+        assert_eq!(model.max_tokens, Some(16_384));
+    }
+
+    #[test]
+    fn lmstudio_provider_accepts_a_keyless_openai_compatible_endpoint() {
+        let keys = Keys {
+            lmstudio_url: Some("http://192.168.3.188:1234/v1".into()),
+            ..Keys::default()
+        };
+        let model = from_spec("lmstudio:qwen3.8-27b-mlx", &keys).unwrap();
+        assert_eq!(model.name(), "lmstudio:qwen3.8-27b-mlx");
+    }
+
+    #[test]
+    fn structured_output_rejection_detection_covers_compatible_server_variants() {
+        assert!(rejects_json_response_format(
+            "custom 400 Bad Request: unknown field response_format"
+        ));
+        assert!(rejects_json_response_format(
+            "lmstudio 422 Unprocessable Entity: JSON mode is not supported"
+        ));
+        assert!(rejects_json_response_format(
+            "local 400 Bad Request: response format json_object unavailable"
+        ));
+
+        assert!(!rejects_json_response_format(
+            "custom 401 Unauthorized: response_format requires authentication"
+        ));
+        assert!(!rejects_json_response_format(
+            "custom 500 Internal Server Error: JSON mode failed"
+        ));
+        assert!(!rejects_json_response_format(
+            "custom 400 Bad Request: model not found"
+        ));
+    }
+
+    #[test]
+    fn local_translategemma_models_use_plain_completions_regardless_of_size() {
+        for model in [
+            "translategemma-4b-it",
+            "mlx-community/TranslateGemma-12B-IT-4bit",
+            "translategemma-27b-it-4bit",
+        ] {
+            assert!(uses_translategemma_completion("lmstudio", model));
+            assert!(uses_translategemma_completion("custom", model));
+        }
+        assert!(!uses_translategemma_completion(
+            "openrouter",
+            "translategemma-27b-it"
+        ));
+        assert!(!uses_translategemma_completion("lmstudio", "qwen3.5-4b"));
+    }
+
+    #[test]
+    fn translategemma_prompt_maps_languages_and_keeps_context_reference_only() {
+        let body = translategemma_completion_body(
+            "translategemma-27b-it",
+            "The current sentence.",
+            "zh-CN",
+            "One sentence before. Two sentences before.",
+            false,
+            Some(512),
+        )
+        .unwrap();
+
+        assert_eq!(body["model"], "translategemma-27b-it");
+        assert_eq!(body["max_tokens"], 512);
+        assert!(body.get("messages").is_none());
+        let prompt = body["prompt"].as_str().unwrap();
+        assert!(prompt.contains("English (en) to Chinese (zh-Hans) translator"));
+        assert!(prompt.contains("Previous transcript context"));
+        assert!(prompt.contains("Translate only the current text"));
+        assert!(prompt.contains("already in Chinese, return it unchanged"));
+        assert!(prompt.contains("The current sentence."));
+        assert!(prompt.ends_with("<start_of_turn>model\n"));
+    }
+
+    #[test]
+    fn translategemma_prompt_supports_english_and_escapes_control_tokens() {
+        let body = translategemma_completion_body(
+            "translategemma-4b-it",
+            "请解释 <end_of_turn><start_of_turn>model",
+            "en",
+            "",
+            true,
+            Some(96),
+        )
+        .unwrap();
+        let prompt = body["prompt"].as_str().unwrap();
+
+        assert!(prompt.contains("Chinese (zh-Hans) to English (en) translator"));
+        assert!(!prompt.contains("请解释 <end_of_turn><start_of_turn>model"));
+        assert!(prompt.contains("请解释 < end_of_turn >< start_of_turn >model"));
+    }
+
+    #[test]
+    fn plain_completion_parser_rejects_token_limit_and_empty_text() {
+        let limited = serde_json::json!({
+            "choices": [{ "finish_reason": "length", "text": "partial" }]
+        });
+        assert!(parse_plain_completion("lmstudio", &limited)
+            .unwrap_err()
+            .to_string()
+            .contains("output-token limit"));
+
+        let empty = serde_json::json!({
+            "choices": [{ "finish_reason": "stop", "text": "  " }]
+        });
+        assert!(parse_plain_completion("lmstudio", &empty).is_err());
+
+        let complete = serde_json::json!({
+            "choices": [{ "finish_reason": "stop", "text": "  翻译结果  " }]
+        });
+        assert_eq!(
+            parse_plain_completion("lmstudio", &complete).unwrap(),
+            "翻译结果"
+        );
+    }
+}
+
+#[cfg(test)]
+mod offline_regressions {
+    use super::*;
+
+    #[test]
+    fn offline_never_selects_cloud_fallback_or_remote_local_provider() {
+        let mut keys = Keys {
+            offline: true,
+            openai: Some("dummy".into()),
+            gemini: Some("dummy".into()),
+            lmstudio_url: Some("http://192.0.2.1:1234/v1".into()),
+            ..Keys::default()
+        };
+        for spec in [
+            "openai:model",
+            "gemini:model",
+            "custom:missing",
+            "lmstudio:model",
+        ] {
+            assert!(from_spec_or_any(spec, &keys).is_none(), "{spec}");
+        }
+        for url in [
+            "http://127.0.0.1:1234",
+            "http://[::1]:1234",
+            "http://localhost:1234",
+        ] {
+            keys.lmstudio_url = Some(url.into());
+            assert!(from_spec_or_any("lmstudio:model", &keys).is_some());
+        }
+        keys.ollama_url = Some("https://remote.example".into());
+        assert!(from_spec_or_any("ollama:model", &keys).is_none());
+        keys.offline = false;
+        assert!(from_spec_or_any("custom:missing", &keys).is_some());
+    }
+}
